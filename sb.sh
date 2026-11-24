@@ -17,13 +17,13 @@
 #
 # 用法：
 #   sudo ./sb.sh                    # 打开菜单
-#   sudo ./sb.sh add-vless [--port 443] [--sni www.microsoft.com] [--name TR-VLESS] [--ipv6|--ipv4|--ip <v4|v6|auto|IP>]
-#   sudo ./sb.sh add-hy2   [--port 443] [--name TR-Hy2] [--up 200] [--down 1000] [--ipv6|--ipv4|--ip <v4|v6|auto|IP>]
+#   sudo ./sb.sh add-vless [--port 443] [--sni www.microsoft.com] [--name TR-VLESS] [--ipv6|--ipv4|--ip <v4|v6|both|auto|IP>]
+#   sudo ./sb.sh add-hy2   [--port 443] [--name TR-Hy2] [--up 200] [--down 1000] [--ipv6|--ipv4|--ip <v4|v6|both|auto|IP>]
 #   sudo ./sb.sh list               # 显示所有节点：链接 + Clash 配置
 #   sudo ./sb.sh clash              # 生成 Clash 配置（规则跟你现在用的一套）
 #   sudo ./sb.sh sub                # 生成订阅文件并启动订阅服务
 #   sudo ./sb.sh reject             # 查看并重新应用服务端拦截规则（菜单里第 10 项）
-#   sudo ./sb.sh set-ip [v4|v6|auto|<具体IP>]  # 改节点 IP：换服务器 IP 或想固定用 v6 时用
+#   sudo ./sb.sh set-ip [v4|v6|both|auto|<具体IP>]  # 改节点 IP：换服务器 IP 或想 v4/v6 都要时用
 #   sudo ./sb.sh status | restart | logs | uninstall
 #
 # 白名单直连域名（空格分隔）：这些走直连，其余全部走代理。
@@ -42,7 +42,7 @@ SUBSCRIBE_PORT="62201"
 #   配置：/etc/sing-box/config.json（改之前自动备份成 config.json.bak）
 #   节点记录：/etc/sb-manager/nodes.json（只存你自己的节点信息）
 #   生成的 Clash 配置：/etc/sb-manager/clash.yaml
-#   IP 偏好：/etc/sb-manager/ip_mode（auto / v4 / v6 / 具体 IP，用 ./sb.sh set-ip 改）
+#   IP 偏好：/etc/sb-manager/ip_mode（auto / v4 / v6 / both / 具体 IP，用 ./sb.sh set-ip 改）
 #
 # 注意：每次改配置后都会先跑 sing-box check，校验通过才重载服务。
 # ============================================================================
@@ -68,20 +68,25 @@ need_root() {
   fi
 }
 
-# 服务器公网 IP：偏好存在 $SB_STATE_DIR/ip_mode 里（auto / v4 / v6 / 具体 IP）
-# 默认 auto：优先 v4，没有再用 v6。改偏好用 ./sb.sh set-ip。
+# 探测公网 IP（v4 / v6 各一个函数，server_ip / server_ips / set-ip 共用）
+detect_v4() { curl -s4 --max-time 5 https://ifconfig.me || true; }
+detect_v6() { curl -s6 --max-time 5 https://ifconfig.me || true; }
+
+# 服务器公网 IP：偏好存在 $SB_STATE_DIR/ip_mode 里（auto / v4 / v6 / both / 具体 IP）
+# 默认 auto：优先 v4，没有再用 v6。both 模式这里只返回 v4（订阅地址用），
+# 拿全部地址用 server_ips。改偏好用 ./sb.sh set-ip。
 server_ip() {
   local mode ip
   mode=$(cat "$SB_STATE_DIR/ip_mode" 2>/dev/null || echo auto)
   case "$mode" in
     v6)
-      ip=$(curl -s6 --max-time 5 https://ifconfig.me || true) ;;
+      ip=$(detect_v6) ;;
     v4)
-      ip=$(curl -s4 --max-time 5 https://ifconfig.me || true) ;;
-    auto|"")
-      ip=$(curl -s4 --max-time 5 https://ifconfig.me || true)
+      ip=$(detect_v4) ;;
+    auto|both|"")
+      ip=$(detect_v4)
       if [ -z "$ip" ]; then
-        ip=$(curl -s6 --max-time 5 https://ifconfig.me || true)
+        ip=$(detect_v6)
       fi ;;
     *)  # 写死了一个具体 IP，直接用
       ip="$mode" ;;
@@ -89,16 +94,34 @@ server_ip() {
   echo "$ip"
 }
 
-# 改节点 IP：set-ip [v4|v6|auto|<具体IP>]
-#   v4 / v6 / auto：改自动探测的偏好；具体 IP：写死这个地址。
-#   改完把已建节点的 server 全换掉，并重新生成 Clash 配置和订阅。
+# 返回节点要用的 IP 列表：mode=both 时 v4 和 v6 各一行，其余一行
+server_ips() {
+  local mode
+  mode=$(cat "$SB_STATE_DIR/ip_mode" 2>/dev/null || echo auto)
+  if [ "$mode" = "both" ]; then
+    local v4 v6
+    v4=$(detect_v4)
+    v6=$(detect_v6)
+    [ -n "$v4" ] && echo "$v4"
+    [ -n "$v6" ] && echo "$v6"
+  else
+    server_ip
+  fi
+}
+
+# 改节点 IP：set-ip [v4|v6|both|auto|<具体IP>]
+#   v4 / v6 / auto：改自动探测的偏好；both：v4 和 v6 都要（各建一个节点）；
+#   具体 IP：写死这个地址。
+#   改完把已建节点按当前模式整理一遍（补齐 / 删除对应的 v4/v6 变体），
+#   并重新生成 Clash 配置和订阅。
 set_ip() {
   local arg="${1:-}"
   if [ -z "$arg" ]; then
     echo "当前 IP 偏好：$(cat "$SB_STATE_DIR/ip_mode" 2>/dev/null || echo auto)"
     echo "当前服务器 IP：$(server_ip)"
-    echo "用法：$0 set-ip [v4|v6|auto|<具体IP>]"
+    echo "用法：$0 set-ip [v4|v6|both|auto|<具体IP>]"
     echo "  v4 / v6：之后建节点只用对应协议的 IP"
+    echo "  both：v4 和 v6 各建一个节点（v6 的名字加 -v6 后缀）"
     echo "  auto：优先 v4，没有再用 v6（默认）"
     echo "  具体 IP：写死这个 IP（换了服务器 IP 或想固定用某个地址时用）"
     return 0
@@ -106,31 +129,80 @@ set_ip() {
   need_root
   init_config
   case "$arg" in
-    v4|v6|auto) echo "$arg" > "$SB_STATE_DIR/ip_mode" ;;
+    v4|v6|both|auto) echo "$arg" > "$SB_STATE_DIR/ip_mode" ;;
     *:*|*.*.*.*) echo "$arg" > "$SB_STATE_DIR/ip_mode" ;;
-    *) echo "不认识：$arg（用 v4 / v6 / auto / 具体 IP）" >&2; exit 1 ;;
+    *) echo "不认识：$arg（用 v4 / v6 / both / auto / 具体 IP）" >&2; exit 1 ;;
   esac
-  local ip count
-  ip=$(server_ip)
-  if [ -z "$ip" ]; then echo "拿不到服务器公网 IP，请检查网络" >&2; exit 1; fi
-  # 更新已建节点的 server
-  IP="$ip" python3 - "$NODES" <<'PYEOF'
+  local ip="" v4="" v6="" count=0
+  if [ "$arg" = "both" ]; then
+    v4=$(detect_v4)
+    v6=$(detect_v6)
+    if [ -z "$v4" ] && [ -z "$v6" ]; then echo "拿不到服务器公网 IP，请检查网络" >&2; exit 1; fi
+  else
+    ip=$(server_ip)
+    if [ -z "$ip" ]; then echo "拿不到服务器公网 IP，请检查网络" >&2; exit 1; fi
+  fi
+  # 按当前模式整理节点：both 补齐双变体，单 IP 模式只留一条
+  MODE="$arg" IP="$ip" V4="$v4" V6="$v6" python3 - "$NODES" <<'PYEOF'
 import json, os, sys
 path = sys.argv[1]
+mode = os.environ["MODE"]
+ip = os.environ.get("IP", "")
+v4 = os.environ.get("V4", "")
+v6 = os.environ.get("V6", "")
 with open(path) as f:
     nodes = json.load(f)
+groups = {}
+order = []
 for n in nodes:
-    n["server"] = os.environ["IP"]
+    name = n["name"]
+    is_v6 = name.endswith("-v6")
+    base = name[:-3] if is_v6 else name
+    key = (n.get("type"), str(n.get("port")), base)
+    if key not in groups:
+        groups[key] = {}
+        order.append(key)
+    groups[key]["v6" if is_v6 else "v4"] = n
+out = []
+for key in order:
+    variants = groups[key]
+    if mode == "both":
+        have = [x for x in (v4, v6) if x]
+        if len(have) == 1:
+            # 只有一个协议可用时，不加 -v6 后缀
+            rec = dict(variants.get("v4") or variants.get("v6"))
+            rec["name"] = key[2]; rec["server"] = have[0]
+            out.append(rec)
+        else:
+            if v4:
+                rec = dict(variants.get("v4") or variants.get("v6"))
+                rec["name"] = key[2]; rec["server"] = v4
+                out.append(rec)
+            if v6:
+                rec = dict(variants.get("v6") or variants.get("v4"))
+                rec["name"] = key[2] + "-v6"; rec["server"] = v6
+                out.append(rec)
+    else:
+        rec = dict(variants.get("v4") or variants.get("v6"))
+        rec["name"] = key[2]; rec["server"] = ip
+        out.append(rec)
 with open(path, "w") as f:
-    json.dump(nodes, f, indent=2)
+    json.dump(out, f, indent=2)
 PYEOF
   count=$(python3 -c "import json; print(len(json.load(open('$NODES'))))")
   if [ "$count" -gt 0 ]; then
-    echo "节点 IP 已改为：$ip（$count 个节点已更新），正在重新生成 Clash 配置和订阅……"
+    if [ "$arg" = "both" ]; then
+      local both_desc=""
+      [ -n "$v4" ] && both_desc="v4 $v4"
+      [ -n "$v6" ] && both_desc="${both_desc:+$both_desc，}v6 $v6"
+      echo "节点 IP 已改为双栈：$both_desc（$count 个节点），正在重新生成 Clash 配置和订阅……"
+    else
+      echo "节点 IP 已改为：$ip（$count 个节点已更新），正在重新生成 Clash 配置和订阅……"
+    fi
     gen_clash >/dev/null
     gen_subscribe
   else
-    echo "IP 偏好已保存（当前 $ip）。还没有节点，之后建节点会用这个 IP。"
+    echo "IP 偏好已保存。还没有节点，之后建节点会用这个设置。"
   fi
 }
 
@@ -275,14 +347,14 @@ add_vless() {
     echo "$ip_arg" > "$SB_STATE_DIR/ip_mode"
   fi
 
-  local uuid keypair privkey pubkey shortid ip
+  local uuid keypair privkey pubkey shortid servers ip
   uuid=$(sing-box generate uuid)
   keypair=$(sing-box generate reality-keypair)
   privkey=$(echo "$keypair" | awk '/PrivateKey/{print $2}')
   pubkey=$(echo "$keypair" | awk '/PublicKey/{print $2}')
   shortid=$(openssl rand -hex 4)
-  ip=$(server_ip)
-  if [ -z "$ip" ]; then echo "拿不到服务器公网 IP，请检查网络" >&2; exit 1; fi
+  servers=$(server_ips)
+  if [ -z "$servers" ]; then echo "拿不到服务器公网 IP，请检查网络" >&2; exit 1; fi
 
   # 写入 inbound（同名 tag 先删再加，重复添加 = 覆盖旧节点）
   PORT="$port" UUID="$uuid" PRIVKEY="$privkey" SHORTID="$shortid" SNI="$sni" \
@@ -315,7 +387,8 @@ with open(path, "w") as f:
 PYEOF
 
   # 记录节点信息（供 list 显示链接和 Clash 配置）
-  NAME="$name" TYPE="vless" SERVER="$ip" PORT="$port" UUID="$uuid" \
+  # 同端口的旧节点先全部删掉（重建 = 覆盖）；both 模式写两条，v6 的名字加 -v6 后缀
+  NAME="$name" TYPE="vless" SERVERS="$servers" PORT="$port" UUID="$uuid" \
   SNI="$sni" PUBKEY="$pubkey" SHORTID="$shortid" \
     python3 - "$NODES" <<'PYEOF'
 import json, os, sys
@@ -323,12 +396,17 @@ path = sys.argv[1]
 with open(path) as f:
     nodes = json.load(f)
 nodes = [n for n in nodes if not (n.get("type") == "vless" and str(n.get("port")) == os.environ["PORT"])]
-nodes.append({
-    "name": os.environ["NAME"], "type": "vless",
-    "server": os.environ["SERVER"], "port": int(os.environ["PORT"]),
-    "uuid": os.environ["UUID"], "sni": os.environ["SNI"],
-    "public_key": os.environ["PUBKEY"], "short_id": os.environ["SHORTID"]
-})
+servers = os.environ["SERVERS"].split()
+for server in servers:
+    name = os.environ["NAME"]
+    if len(servers) > 1 and ":" in server:
+        name = name + "-v6"
+    nodes.append({
+        "name": name, "type": "vless",
+        "server": server, "port": int(os.environ["PORT"]),
+        "uuid": os.environ["UUID"], "sni": os.environ["SNI"],
+        "public_key": os.environ["PUBKEY"], "short_id": os.environ["SHORTID"]
+    })
 with open(path, "w") as f:
     json.dump(nodes, f, indent=2)
 PYEOF
@@ -337,7 +415,8 @@ PYEOF
   reload_config
   gen_subscribe
   echo ""
-  echo "VLESS + Reality 节点已建好：$name ($(fmt_hostport "$ip" "$port"))"
+  echo "VLESS + Reality 节点已建好：$name"
+  for ip in $servers; do echo "  - $(fmt_hostport "$ip" "$port")"; done
   echo "用 ./sb.sh list 查看链接和 Clash 配置"
 }
 
@@ -365,11 +444,11 @@ add_hy2() {
     echo "$ip_arg" > "$SB_STATE_DIR/ip_mode"
   fi
 
-  local password obfs_password ip fingerprint sni="addons.mozilla.org"
+  local password obfs_password servers fingerprint pin_sha256 pubkey_sha256 ip sni="addons.mozilla.org"
   password=$(sing-box generate uuid)
   obfs_password=$(openssl rand -hex 16)
-  ip=$(server_ip)
-  if [ -z "$ip" ]; then echo "拿不到服务器公网 IP，请检查网络" >&2; exit 1; fi
+  servers=$(server_ips)
+  if [ -z "$servers" ]; then echo "拿不到服务器公网 IP，请检查网络" >&2; exit 1; fi
 
   # 自签证书（Hy2 必须有 TLS 证书；没有就用这个自签的，客户端用指纹校验）
   if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
@@ -378,6 +457,10 @@ add_hy2() {
     chmod 600 "$KEY"
   fi
   fingerprint=$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 | cut -d= -f2)
+  # pinSHA256：证书 SHA-256 指纹去掉冒号（链接里固定证书用，不再跳过校验）
+  pin_sha256=$(echo "$fingerprint" | tr -d ':' | tr 'A-F' 'a-f')
+  # 公钥 SHA-256（base64）：sing-box 客户端配置里固定证书用
+  pubkey_sha256=$(openssl x509 -in "$CERT" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null | tr -d '\n')
 
   PORT="$port" PASSWORD="$password" OBFS_PASSWORD="$obfs_password" SNI="$sni" \
   CERT="$CERT" KEY="$KEY" \
@@ -406,8 +489,11 @@ with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
-  NAME="$name" TYPE="hy2" SERVER="$ip" PORT="$port" PASSWORD="$password" \
+  # 记录节点信息（供 list 显示链接和 Clash 配置）
+  # 同端口的旧节点先全部删掉（重建 = 覆盖）；both 模式写两条，v6 的名字加 -v6 后缀
+  NAME="$name" TYPE="hy2" SERVERS="$servers" PORT="$port" PASSWORD="$password" \
   OBFS_PASSWORD="$obfs_password" SNI="$sni" FINGERPRINT="$fingerprint" \
+  PIN_SHA256="$pin_sha256" PUBKEY_SHA256="$pubkey_sha256" \
   UP="$up" DOWN="$down" \
     python3 - "$NODES" <<'PYEOF'
 import json, os, sys
@@ -415,15 +501,22 @@ path = sys.argv[1]
 with open(path) as f:
     nodes = json.load(f)
 nodes = [n for n in nodes if not (n.get("type") == "hy2" and str(n.get("port")) == os.environ["PORT"])]
-nodes.append({
-    "name": os.environ["NAME"], "type": "hy2",
-    "server": os.environ["SERVER"], "port": int(os.environ["PORT"]),
-    "password": os.environ["PASSWORD"],
-    "obfs_password": os.environ["OBFS_PASSWORD"],
-    "sni": os.environ["SNI"],
-    "fingerprint": os.environ["FINGERPRINT"],
-    "up": os.environ["UP"], "down": os.environ["DOWN"]
-})
+servers = os.environ["SERVERS"].split()
+for server in servers:
+    name = os.environ["NAME"]
+    if len(servers) > 1 and ":" in server:
+        name = name + "-v6"
+    nodes.append({
+        "name": name, "type": "hy2",
+        "server": server, "port": int(os.environ["PORT"]),
+        "password": os.environ["PASSWORD"],
+        "obfs_password": os.environ["OBFS_PASSWORD"],
+        "sni": os.environ["SNI"],
+        "fingerprint": os.environ["FINGERPRINT"],
+        "pin_sha256": os.environ["PIN_SHA256"],
+        "pubkey_sha256": os.environ["PUBKEY_SHA256"],
+        "up": os.environ["UP"], "down": os.environ["DOWN"]
+    })
 with open(path, "w") as f:
     json.dump(nodes, f, indent=2)
 PYEOF
@@ -432,7 +525,8 @@ PYEOF
   reload_config
   gen_subscribe
   echo ""
-  echo "Hysteria2 节点已建好：$name ($(fmt_hostport "$ip" "$port"))，Salamander 混淆已开"
+  echo "Hysteria2 节点已建好：$name，Salamander 混淆已开"
+  for ip in $servers; do echo "  - $(fmt_hostport "$ip" "$port")"; done
   echo "用 ./sb.sh list 查看链接和 Clash 配置"
 }
 
@@ -478,11 +572,14 @@ for n in nodes:
         print("  flow: xtls-rprx-vision")
         print("  udp: true")
     else:
+        # pinSHA256：证书固定，只认这张证书，不跳过校验。
+        # 老节点没有 pin_sha256 时，用指纹（去掉冒号）顶上，两者是同一个值。
+        pin = n.get("pin_sha256") or n.get("fingerprint", "").replace(":", "").lower()
         link = ("hysteria2://%s@%s:%s?obfs=salamander&obfs-password=%s"
-                "&sni=%s&insecure=1#%s"
+                "&sni=%s&pinSHA256=%s#%s"
                 % (n["password"], host, n["port"],
-                   n["obfs_password"], n["sni"], enc))
-        print("链接（insecure=1 为跳过证书校验；想更严格可用下面的指纹）：")
+                   n["obfs_password"], n["sni"], pin, enc))
+        print("链接（证书已用 pinSHA256 固定，只认服务器这张证书）：")
         print(link)
         print("")
         print("Clash 配置：")
@@ -500,6 +597,19 @@ for n in nodes:
         print("  down: %s Mbps" % n["down"])
     print("")
 PYEOF
+  # 订阅地址（已生成过订阅才显示）
+  if [ -f "$SUBSCRIBE_TOKEN_FILE" ]; then
+    local sub_ip sub_token
+    sub_ip=$(server_ip)
+    sub_token=$(cat "$SUBSCRIBE_TOKEN_FILE")
+    if [ -n "$sub_ip" ] && [ -n "$sub_token" ]; then
+      echo "============================================================"
+      echo "订阅地址：http://$(fmt_hostport "$sub_ip" "$SUBSCRIBE_PORT")/$sub_token/auto"
+      echo "（Clash Verge / Shadowrocket 里用这个地址当订阅链接）"
+    fi
+  else
+    echo "订阅还没生成：跑 ./sb.sh sub 生成订阅（菜单第 9 项）"
+  fi
 }
 
 # ---------- 生成 Clash 配置（白名单直连，其余全部代理） ----------
@@ -702,9 +812,15 @@ gen_subscribe() {
   # 1) clash：复用 gen_clash 的输出
   gen_clash >/dev/null
   cp "$SB_STATE_DIR/clash.yaml" "$subdir/clash"
+  # 订阅文件里的 sing-box 客户端配置：Hy2 证书固定用的公钥指纹。
+  # 老节点记录里没有这个字段时，从服务器证书现算（所有 Hy2 节点共用一张证书）。
+  local pubkey_sha256=""
+  if [ -f "$CERT" ]; then
+    pubkey_sha256=$(openssl x509 -in "$CERT" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null | tr -d '\n')
+  fi
   # 2) shadowrocket / sing-box / proxies：用 nodes.json 生成
-  python3 - "$NODES" "$subdir" <<'PYEOF'
-import base64, json, sys, urllib.parse
+  PUBKEY_SHA256="$pubkey_sha256" python3 - "$NODES" "$subdir" <<'PYEOF'
+import base64, json, os, sys, urllib.parse
 
 nodes_path, subdir = sys.argv[1], sys.argv[2]
 with open(nodes_path) as f:
@@ -721,10 +837,13 @@ def node_uri(n):
                 "&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s"
                 % (n["uuid"], host, n["port"], n["sni"],
                    n["public_key"], n["short_id"], name))
+    # pinSHA256：证书固定，只认这张证书，不跳过校验。
+    # 老节点没有 pin_sha256 时，用指纹（去掉冒号）顶上，两者是同一个值。
+    pin = n.get("pin_sha256") or n.get("fingerprint", "").replace(":", "").lower()
     return ("hysteria2://%s@%s:%s?obfs=salamander&obfs-password=%s"
-            "&sni=%s&insecure=1#%s"
+            "&sni=%s&pinSHA256=%s#%s"
             % (n["password"], host, n["port"],
-               n["obfs_password"], n["sni"], name))
+               n["obfs_password"], n["sni"], pin, name))
 
 uris = [node_uri(n) for n in nodes]
 # shadowrocket：base64 编码的链接列表（Shadowrocket / Throne / v2rayN 通用）
@@ -769,12 +888,22 @@ for n in nodes:
                                 "short_id": n["short_id"]}}
         })
     else:
+        # 证书固定：只认服务器这张证书的公钥，不跳过校验。
+        # 老节点没有 pubkey_sha256 时，用生成时从证书算的值（PUBKEY_SHA256 环境变量）。
+        pubkey = n.get("pubkey_sha256") or os.environ.get("PUBKEY_SHA256", "")
+        tls = {"enabled": True, "server_name": n["sni"]}
+        if pubkey:
+            tls["certificate_public_key_sha256"] = [pubkey]
+        else:
+            tls["insecure"] = True
         outbounds.append({
             "type": "hysteria2", "tag": n["name"],
             "server": n["server"], "server_port": n["port"],
             "password": n["password"],
-            "tls": {"enabled": True, "server_name": n["sni"], "insecure": True},
-            "obfs": {"type": "salamander", "password": n["obfs_password"]}
+            "tls": tls,
+            "obfs": {"type": "salamander", "password": n["obfs_password"]},
+            "up_mbps": int(n.get("up", 200)),
+            "down_mbps": int(n.get("down", 1000))
         })
     tags.append(n["name"])
 outbounds.append({"type": "selector", "tag": "🚀 节点选择",
@@ -950,14 +1079,14 @@ show_menu() {
     echo "8) 卸载"
     echo "9) 生成订阅并启动订阅服务"
     echo "10) 查看并应用服务端拦截规则（微信 / 支付宝 / 银行 / 政府）"
-    echo "11) 改节点 IP（v4 / v6 / auto / 指定 IP）"
+    echo "11) 改节点 IP（v4 / v6 / both / auto / 指定 IP）"
     echo "0) 退出"
     echo "======================================"
     read -r -p "选一个 [0-11]: " choice
     case "$choice" in
-      1) read -r -p "端口 [443]: " p; read -r -p "伪装域名 [www.microsoft.com]: " s; read -r -p "节点名 [VLESS-Reality]: " n; read -r -p "IP（回车=当前偏好，v6 / v4）: " a
+      1) read -r -p "端口 [443]: " p; read -r -p "伪装域名 [www.microsoft.com]: " s; read -r -p "节点名 [VLESS-Reality]: " n; read -r -p "IP（回车=当前偏好，v6 / v4 / both）: " a
          if [ -n "$a" ]; then add_vless --port "${p:-443}" --sni "${s:-www.microsoft.com}" --name "${n:-VLESS-Reality}" --ip "$a"; else add_vless --port "${p:-443}" --sni "${s:-www.microsoft.com}" --name "${n:-VLESS-Reality}"; fi ;;
-      2) read -r -p "端口 [443]: " p; read -r -p "节点名 [Hy2]: " n; read -r -p "IP（回车=当前偏好，v6 / v4）: " a
+      2) read -r -p "端口 [443]: " p; read -r -p "节点名 [Hy2]: " n; read -r -p "IP（回车=当前偏好，v6 / v4 / both）: " a
          if [ -n "$a" ]; then add_hy2 --port "${p:-443}" --name "${n:-Hy2}" --ip "$a"; else add_hy2 --port "${p:-443}" --name "${n:-Hy2}"; fi ;;
       3) list_nodes ;;
       4) gen_clash ;;
@@ -968,7 +1097,7 @@ show_menu() {
       9) gen_subscribe; setup_subscribe_nginx ;;
       10) show_reject; init_config; reload_config; echo "服务端拦截规则已应用" ;;
       11) cur=$(cat "$SB_STATE_DIR/ip_mode" 2>/dev/null || echo auto)
-          read -r -p "改节点 IP（v4 / v6 / auto / 具体 IP，当前 $cur，回车取消）: " a
+          read -r -p "改节点 IP（v4 / v6 / both / auto / 具体 IP，当前 $cur，回车取消）: " a
           [ -n "$a" ] && set_ip "$a" ;;
       0) exit 0 ;;
       *) echo "没有这个选项" ;;

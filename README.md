@@ -38,15 +38,17 @@ sudo ./sb.sh
 
 ```bash
 sudo ./sb.sh                    # 打开菜单
-sudo ./sb.sh add-vless [--port 443] [--sni www.microsoft.com] [--name TR-VLESS] [--ipv6|--ipv4|--ip <v4|v6|auto|IP>]
-sudo ./sb.sh add-hy2   [--port 443] [--name TR-Hy2] [--up 200] [--down 1000] [--ipv6|--ipv4|--ip <v4|v6|auto|IP>]
-sudo ./sb.sh list               # 显示所有节点：链接 + Clash 配置
+sudo ./sb.sh add-vless [--port 443] [--sni www.microsoft.com] [--name TR-VLESS] [--ipv6|--ipv4|--ip <v4|v6|both|auto|IP>]
+sudo ./sb.sh add-hy2   [--port 443] [--name TR-Hy2] [--up 200] [--down 1000] [--ipv6|--ipv4|--ip <v4|v6|both|auto|IP>]
+sudo ./sb.sh list               # 显示所有节点：链接 + Clash 配置 + 订阅地址
 sudo ./sb.sh clash              # 生成 Clash 配置
 sudo ./sb.sh sub                # 生成订阅文件并启动订阅服务
 sudo ./sb.sh reject             # 查看并重新应用服务端拦截规则（菜单第 10 项）
-sudo ./sb.sh set-ip [v4|v6|auto|<具体IP>]  # 改节点 IP：换服务器 IP 或想固定用 v6 时用（菜单第 11 项）
+sudo ./sb.sh set-ip [v4|v6|both|auto|<具体IP>]  # 改节点 IP：换服务器 IP 或想 v4/v6 都要时用（菜单第 11 项）
 sudo ./sb.sh status | restart | logs | uninstall
 ```
+
+`--ip both` / `set-ip both`：v4 和 v6 各建一个节点（v6 的名字加 `-v6` 后缀），Clash 里两个都能选。
 
 订阅地址（`sub` 会打印出来）：
 
@@ -65,4 +67,5 @@ http://<服务器IP>:62201/<TOKEN>/auto
 ## 注意
 
 - 改配置前自动备份，改完先跑 `sing-box check` 校验通过才重载。
+- Hy2 证书校验：链接用 `pinSHA256` 固定证书，Clash 配置用 `fingerprint`，sing-box 客户端配置用 `certificate_public_key_sha256`；不跳过证书校验。
 - `clash-local.yaml` 是个人 Clash 配置（含节点密码），不要放进仓库。
