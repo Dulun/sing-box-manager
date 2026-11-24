@@ -45,6 +45,7 @@ sudo ./sb.sh clash              # 生成 Clash 配置
 sudo ./sb.sh sub                # 生成订阅文件并启动订阅服务
 sudo ./sb.sh reject             # 查看并重新应用服务端拦截规则（菜单第 10 项）
 sudo ./sb.sh set-ip [v4|v6|both|auto|<具体IP>]  # 改节点 IP：换服务器 IP 或想 v4/v6 都要时用（菜单第 11 项）
+sudo ./sb.sh set-sub-port <端口>  # 改订阅端口，例如 443（菜单第 12 项；端口被 VLESS 之类的占了会拒绝）
 sudo ./sb.sh status | restart | logs | uninstall
 ```
 

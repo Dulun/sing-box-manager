@@ -24,6 +24,7 @@
 #   sudo ./sb.sh sub                # 生成订阅文件并启动订阅服务
 #   sudo ./sb.sh reject             # 查看并重新应用服务端拦截规则（菜单里第 10 项）
 #   sudo ./sb.sh set-ip [v4|v6|both|auto|<具体IP>]  # 改节点 IP：换服务器 IP 或想 v4/v6 都要时用
+#   sudo ./sb.sh set-sub-port <端口>  # 改订阅端口（菜单第 12 项）
 #   sudo ./sb.sh status | restart | logs | uninstall
 #
 # 白名单直连域名（空格分隔）：这些走直连，其余全部走代理。
@@ -35,8 +36,8 @@ WHITELIST_DOMAINS="ezhiben.com apsaradb.com aliyuncs.com bilibili.com hdslb.com 
 # 或任意一次 add / restart 都会重新应用。
 REJECT_DOMAINS="weixin.qq.com wx.qq.com wechat.com qq.com tenpay.com alipay.com alipay.cn alipayobjects.com alipayplus.com alipayhk.com antfin.com gov.cn icbc.com icbc.com.cn ccb.com ccbank.com.cn abchina.com abchina.com.cn boc.cn bankofchina.com bankcomm.com bankcomm.cn cmbchina.com psbc.com ecitic.com citicbank.com cebbank.com spdb.com.cn cib.com.cn cmbc.com.cn pingan.com hxb.com.cn cgbchina.com.cn czbank.com cbhb.com.cn hengfengbank.com bankofbeijing.com.cn bankofshanghai.com bosh.cn jsbchina.cn nbcb.com.cn nbcb.cn njcb.com.cn unionpay.com unionpaysecure.com"
 #
-# 订阅服务端口（nginx 监听，TCP）
-SUBSCRIBE_PORT="62201"
+# 订阅服务端口（nginx 监听，TCP）：默认 62201，改用 ./sb.sh set-sub-port <端口>
+# 实际值存在 /etc/sb-manager/subscribe_port 里，脚本启动时读进来。
 #
 # 文件位置：
 #   配置：/etc/sing-box/config.json（改之前自动备份成 config.json.bak）
@@ -57,6 +58,8 @@ KEY="$SB_BASE/key.pem"
 SUBSCRIBE_DIR="$SB_STATE_DIR/subscribe"
 SUBSCRIBE_TOKEN_FILE="$SB_STATE_DIR/subscribe_token"
 SUBSCRIBE_NGINX_CONF="$SB_STATE_DIR/nginx.conf"
+SUBSCRIBE_PORT="$(cat "$SB_STATE_DIR/subscribe_port" 2>/dev/null || echo 62201)"
+[ -z "$SUBSCRIBE_PORT" ] && SUBSCRIBE_PORT=62201
 
 # ---------- 基础工具 ----------
 
@@ -204,6 +207,51 @@ PYEOF
   else
     echo "IP 偏好已保存。还没有节点，之后建节点会用这个设置。"
   fi
+}
+
+# 改订阅端口：set-sub-port <端口>
+#   改完重新生成订阅并重启订阅服务（nginx）。端口被别的程序占了就拒绝，
+#   避免 nginx 起不来。token 不变，订阅地址只换端口。
+set_sub_port() {
+  local port="${1:-}"
+  if [ -z "$port" ]; then
+    echo "当前订阅端口：$SUBSCRIBE_PORT"
+    echo "用法：$0 set-sub-port <端口>（1-65535，例如 443）"
+    return 0
+  fi
+  case "$port" in
+    ''|*[!0-9]*)
+      echo "端口要是数字：$port" >&2; exit 1 ;;
+  esac
+  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    echo "端口范围 1-65535：$port" >&2; exit 1
+  fi
+  need_root
+  init_config
+  # 检查 TCP 端口有没有被别的程序占了
+  if command -v ss >/dev/null 2>&1; then
+    local holder sub_pid in_use=0
+    holder=$(ss -tlnp 2>/dev/null | grep -E "[:.]$port[[:space:]]" || true)
+    sub_pid=$(cat /var/run/sb-subscribe-nginx.pid 2>/dev/null || true)
+    if [ -n "$holder" ]; then
+      in_use=1
+      # 订阅服务自己占着这个端口不算冲突（改回同一个端口时）
+      if [ -n "$sub_pid" ] && echo "$holder" | grep -q "pid=$sub_pid"; then
+        in_use=0
+      fi
+    fi
+    if [ "$in_use" -eq 1 ]; then
+      echo "TCP $port 已被占用，订阅服务起不来：" >&2
+      echo "$holder" >&2
+      echo "换个端口，或者先把占着它的服务挪走。" >&2
+      exit 1
+    fi
+  fi
+  echo "$port" > "$SB_STATE_DIR/subscribe_port"
+  SUBSCRIBE_PORT="$port"
+  gen_subscribe
+  setup_subscribe_nginx
+  echo "订阅端口已改为：$port"
 }
 
 # URL 编码节点名（生成链接用）
@@ -1080,9 +1128,10 @@ show_menu() {
     echo "9) 生成订阅并启动订阅服务"
     echo "10) 查看并应用服务端拦截规则（微信 / 支付宝 / 银行 / 政府）"
     echo "11) 改节点 IP（v4 / v6 / both / auto / 指定 IP）"
+    echo "12) 改订阅端口（当前 $SUBSCRIBE_PORT）"
     echo "0) 退出"
     echo "======================================"
-    read -r -p "选一个 [0-11]: " choice
+    read -r -p "选一个 [0-12]: " choice
     case "$choice" in
       1) read -r -p "端口 [443]: " p; read -r -p "伪装域名 [www.microsoft.com]: " s; read -r -p "节点名 [VLESS-Reality]: " n; read -r -p "IP（回车=当前偏好，v6 / v4 / both）: " a
          if [ -n "$a" ]; then add_vless --port "${p:-443}" --sni "${s:-www.microsoft.com}" --name "${n:-VLESS-Reality}" --ip "$a"; else add_vless --port "${p:-443}" --sni "${s:-www.microsoft.com}" --name "${n:-VLESS-Reality}"; fi ;;
@@ -1099,6 +1148,8 @@ show_menu() {
       11) cur=$(cat "$SB_STATE_DIR/ip_mode" 2>/dev/null || echo auto)
           read -r -p "改节点 IP（v4 / v6 / both / auto / 具体 IP，当前 $cur，回车取消）: " a
           [ -n "$a" ] && set_ip "$a" ;;
+      12) read -r -p "订阅端口（当前 $SUBSCRIBE_PORT，回车取消）: " p
+          [ -n "$p" ] && set_sub_port "$p" ;;
       0) exit 0 ;;
       *) echo "没有这个选项" ;;
     esac
@@ -1116,9 +1167,10 @@ case "${1:-menu}" in
   sub)       gen_subscribe; setup_subscribe_nginx ;;
   reject)    show_reject; init_config; reload_config; echo "服务端拦截规则已应用" ;;
   set-ip)    shift; set_ip "$@" ;;
+  set-sub-port) shift; set_sub_port "$@" ;;
   status)    do_status ;;
   restart)   do_restart ;;
   logs)      do_logs ;;
   uninstall) do_uninstall ;;
-  *) echo "用法：$0 [menu|add-vless|add-hy2|list|clash|sub|reject|set-ip|status|restart|logs|uninstall]" >&2; exit 1 ;;
+  *) echo "用法：$0 [menu|add-vless|add-hy2|list|clash|sub|reject|set-ip|set-sub-port|status|restart|logs|uninstall]" >&2; exit 1 ;;
 esac
