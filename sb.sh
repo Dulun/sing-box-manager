@@ -17,12 +17,13 @@
 #
 # 用法：
 #   sudo ./sb.sh                    # 打开菜单
-#   sudo ./sb.sh add-vless [--port 443] [--sni www.microsoft.com] [--name TR-VLESS]
-#   sudo ./sb.sh add-hy2   [--port 443] [--name TR-Hy2] [--up 200] [--down 1000]
+#   sudo ./sb.sh add-vless [--port 443] [--sni www.microsoft.com] [--name TR-VLESS] [--ipv6|--ipv4|--ip <v4|v6|auto|IP>]
+#   sudo ./sb.sh add-hy2   [--port 443] [--name TR-Hy2] [--up 200] [--down 1000] [--ipv6|--ipv4|--ip <v4|v6|auto|IP>]
 #   sudo ./sb.sh list               # 显示所有节点：链接 + Clash 配置
 #   sudo ./sb.sh clash              # 生成 Clash 配置（规则跟你现在用的一套）
 #   sudo ./sb.sh sub                # 生成订阅文件并启动订阅服务
-#   sudo ./sb.sh reject             # 重新应用服务端拦截规则
+#   sudo ./sb.sh reject             # 查看并重新应用服务端拦截规则（菜单里第 10 项）
+#   sudo ./sb.sh set-ip [v4|v6|auto|<具体IP>]  # 改节点 IP：换服务器 IP 或想固定用 v6 时用
 #   sudo ./sb.sh status | restart | logs | uninstall
 #
 # 白名单直连域名（空格分隔）：这些走直连，其余全部走代理。
@@ -41,6 +42,7 @@ SUBSCRIBE_PORT="62201"
 #   配置：/etc/sing-box/config.json（改之前自动备份成 config.json.bak）
 #   节点记录：/etc/sb-manager/nodes.json（只存你自己的节点信息）
 #   生成的 Clash 配置：/etc/sb-manager/clash.yaml
+#   IP 偏好：/etc/sb-manager/ip_mode（auto / v4 / v6 / 具体 IP，用 ./sb.sh set-ip 改）
 #
 # 注意：每次改配置后都会先跑 sing-box check，校验通过才重载服务。
 # ============================================================================
@@ -66,14 +68,70 @@ need_root() {
   fi
 }
 
-# 服务器公网 IP：优先 v4，没有再用 v6
+# 服务器公网 IP：偏好存在 $SB_STATE_DIR/ip_mode 里（auto / v4 / v6 / 具体 IP）
+# 默认 auto：优先 v4，没有再用 v6。改偏好用 ./sb.sh set-ip。
 server_ip() {
-  local ip
-  ip=$(curl -s4 --max-time 5 https://ifconfig.me || true)
-  if [ -z "$ip" ]; then
-    ip=$(curl -s6 --max-time 5 https://ifconfig.me || true)
-  fi
+  local mode ip
+  mode=$(cat "$SB_STATE_DIR/ip_mode" 2>/dev/null || echo auto)
+  case "$mode" in
+    v6)
+      ip=$(curl -s6 --max-time 5 https://ifconfig.me || true) ;;
+    v4)
+      ip=$(curl -s4 --max-time 5 https://ifconfig.me || true) ;;
+    auto|"")
+      ip=$(curl -s4 --max-time 5 https://ifconfig.me || true)
+      if [ -z "$ip" ]; then
+        ip=$(curl -s6 --max-time 5 https://ifconfig.me || true)
+      fi ;;
+    *)  # 写死了一个具体 IP，直接用
+      ip="$mode" ;;
+  esac
   echo "$ip"
+}
+
+# 改节点 IP：set-ip [v4|v6|auto|<具体IP>]
+#   v4 / v6 / auto：改自动探测的偏好；具体 IP：写死这个地址。
+#   改完把已建节点的 server 全换掉，并重新生成 Clash 配置和订阅。
+set_ip() {
+  local arg="${1:-}"
+  if [ -z "$arg" ]; then
+    echo "当前 IP 偏好：$(cat "$SB_STATE_DIR/ip_mode" 2>/dev/null || echo auto)"
+    echo "当前服务器 IP：$(server_ip)"
+    echo "用法：$0 set-ip [v4|v6|auto|<具体IP>]"
+    echo "  v4 / v6：之后建节点只用对应协议的 IP"
+    echo "  auto：优先 v4，没有再用 v6（默认）"
+    echo "  具体 IP：写死这个 IP（换了服务器 IP 或想固定用某个地址时用）"
+    return 0
+  fi
+  need_root
+  init_config
+  case "$arg" in
+    v4|v6|auto) echo "$arg" > "$SB_STATE_DIR/ip_mode" ;;
+    *:*|*.*.*.*) echo "$arg" > "$SB_STATE_DIR/ip_mode" ;;
+    *) echo "不认识：$arg（用 v4 / v6 / auto / 具体 IP）" >&2; exit 1 ;;
+  esac
+  local ip count
+  ip=$(server_ip)
+  if [ -z "$ip" ]; then echo "拿不到服务器公网 IP，请检查网络" >&2; exit 1; fi
+  # 更新已建节点的 server
+  IP="$ip" python3 - "$NODES" <<'PYEOF'
+import json, os, sys
+path = sys.argv[1]
+with open(path) as f:
+    nodes = json.load(f)
+for n in nodes:
+    n["server"] = os.environ["IP"]
+with open(path, "w") as f:
+    json.dump(nodes, f, indent=2)
+PYEOF
+  count=$(python3 -c "import json; print(len(json.load(open('$NODES'))))")
+  if [ "$count" -gt 0 ]; then
+    echo "节点 IP 已改为：$ip（$count 个节点已更新），正在重新生成 Clash 配置和订阅……"
+    gen_clash >/dev/null
+    gen_subscribe
+  else
+    echo "IP 偏好已保存（当前 $ip）。还没有节点，之后建节点会用这个 IP。"
+  fi
 }
 
 # URL 编码节点名（生成链接用）
@@ -155,6 +213,15 @@ with open(path, "w") as f:
 PYEOF
 }
 
+# 查看服务端拦截规则
+show_reject() {
+  echo "服务端拦截规则（命中就拒绝，客户端开全局也不会走代理）："
+  echo "$REJECT_DOMAINS" | tr ' ' '\n' | sed 's/^/  - /'
+  echo ""
+  echo "共 $(echo "$REJECT_DOMAINS" | wc -w) 个域名。想增减：改 sb.sh 顶部的 REJECT_DOMAINS，"
+  echo "然后跑 ./sb.sh reject 应用（菜单里第 10 项也可以）。"
+}
+
 # 改配置前备份，校验通过才重载；失败则还原
 reload_config() {
   cp "$CONFIG" "$CONFIG.bak"
@@ -188,12 +255,15 @@ allow_port() {
 # ---------- 添加 VLESS + Reality ----------
 
 add_vless() {
-  local port=443 sni="www.microsoft.com" name="VLESS-Reality"
+  local port=443 sni="www.microsoft.com" name="VLESS-Reality" ip_arg=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --port) port="$2"; shift 2 ;;
       --sni)  sni="$2";  shift 2 ;;
       --name) name="$2"; shift 2 ;;
+      --ipv6) ip_arg="v6"; shift ;;
+      --ipv4) ip_arg="v4"; shift ;;
+      --ip)   ip_arg="$2"; shift 2 ;;
       *) echo "未知参数：$1" >&2; exit 1 ;;
     esac
   done
@@ -201,6 +271,9 @@ add_vless() {
   need_root
   ensure_singbox
   init_config
+  if [ -n "$ip_arg" ]; then
+    echo "$ip_arg" > "$SB_STATE_DIR/ip_mode"
+  fi
 
   local uuid keypair privkey pubkey shortid ip
   uuid=$(sing-box generate uuid)
@@ -271,13 +344,16 @@ PYEOF
 # ---------- 添加 Hysteria2 + Salamander ----------
 
 add_hy2() {
-  local port=443 name="Hy2" up=200 down=1000
+  local port=443 name="Hy2" up=200 down=1000 ip_arg=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --port) port="$2"; shift 2 ;;
       --name) name="$2"; shift 2 ;;
       --up)   up="$2";   shift 2 ;;
       --down) down="$2"; shift 2 ;;
+      --ipv6) ip_arg="v6"; shift ;;
+      --ipv4) ip_arg="v4"; shift ;;
+      --ip)   ip_arg="$2"; shift 2 ;;
       *) echo "未知参数：$1" >&2; exit 1 ;;
     esac
   done
@@ -285,6 +361,9 @@ add_hy2() {
   need_root
   ensure_singbox
   init_config
+  if [ -n "$ip_arg" ]; then
+    echo "$ip_arg" > "$SB_STATE_DIR/ip_mode"
+  fi
 
   local password obfs_password ip fingerprint sni="addons.mozilla.org"
   password=$(sing-box generate uuid)
@@ -870,14 +949,16 @@ show_menu() {
     echo "7) 查看日志"
     echo "8) 卸载"
     echo "9) 生成订阅并启动订阅服务"
+    echo "10) 查看并应用服务端拦截规则（微信 / 支付宝 / 银行 / 政府）"
+    echo "11) 改节点 IP（v4 / v6 / auto / 指定 IP）"
     echo "0) 退出"
     echo "======================================"
-    read -r -p "选一个 [0-8]: " choice
+    read -r -p "选一个 [0-11]: " choice
     case "$choice" in
-      1) read -r -p "端口 [443]: " p; read -r -p "伪装域名 [www.microsoft.com]: " s; read -r -p "节点名 [VLESS-Reality]: " n
-         add_vless --port "${p:-443}" --sni "${s:-www.microsoft.com}" --name "${n:-VLESS-Reality}" ;;
-      2) read -r -p "端口 [443]: " p; read -r -p "节点名 [Hy2]: " n
-         add_hy2 --port "${p:-443}" --name "${n:-Hy2}" ;;
+      1) read -r -p "端口 [443]: " p; read -r -p "伪装域名 [www.microsoft.com]: " s; read -r -p "节点名 [VLESS-Reality]: " n; read -r -p "IP（回车=当前偏好，v6 / v4）: " a
+         if [ -n "$a" ]; then add_vless --port "${p:-443}" --sni "${s:-www.microsoft.com}" --name "${n:-VLESS-Reality}" --ip "$a"; else add_vless --port "${p:-443}" --sni "${s:-www.microsoft.com}" --name "${n:-VLESS-Reality}"; fi ;;
+      2) read -r -p "端口 [443]: " p; read -r -p "节点名 [Hy2]: " n; read -r -p "IP（回车=当前偏好，v6 / v4）: " a
+         if [ -n "$a" ]; then add_hy2 --port "${p:-443}" --name "${n:-Hy2}" --ip "$a"; else add_hy2 --port "${p:-443}" --name "${n:-Hy2}"; fi ;;
       3) list_nodes ;;
       4) gen_clash ;;
       5) do_status ;;
@@ -885,6 +966,10 @@ show_menu() {
       7) do_logs ;;
       8) do_uninstall ;;
       9) gen_subscribe; setup_subscribe_nginx ;;
+      10) show_reject; init_config; reload_config; echo "服务端拦截规则已应用" ;;
+      11) cur=$(cat "$SB_STATE_DIR/ip_mode" 2>/dev/null || echo auto)
+          read -r -p "改节点 IP（v4 / v6 / auto / 具体 IP，当前 $cur，回车取消）: " a
+          [ -n "$a" ] && set_ip "$a" ;;
       0) exit 0 ;;
       *) echo "没有这个选项" ;;
     esac
@@ -900,10 +985,11 @@ case "${1:-menu}" in
   list)      list_nodes ;;
   clash)     gen_clash ;;
   sub)       gen_subscribe; setup_subscribe_nginx ;;
-  reject)    init_config; reload_config; echo "服务端拦截规则已应用" ;;
+  reject)    show_reject; init_config; reload_config; echo "服务端拦截规则已应用" ;;
+  set-ip)    shift; set_ip "$@" ;;
   status)    do_status ;;
   restart)   do_restart ;;
   logs)      do_logs ;;
   uninstall) do_uninstall ;;
-  *) echo "用法：$0 [menu|add-vless|add-hy2|list|clash|sub|reject|status|restart|logs|uninstall]" >&2; exit 1 ;;
+  *) echo "用法：$0 [menu|add-vless|add-hy2|list|clash|sub|reject|set-ip|status|restart|logs|uninstall]" >&2; exit 1 ;;
 esac
