@@ -1,0 +1,4 @@
+# 个人 Clash 配置（含节点密码），不要进仓库
+clash-local.yaml
+*.bak
+*.bak-*

@@ -1,0 +1,51 @@
+# sing-box-manager
+
+sing-box 轻量管理脚本，只做两件事：
+
+1. **VLESS + Reality**（TCP 443，伪装域名可改）
+2. **Hysteria2 + Salamander 混淆**（UDP 443，自签证书 + 指纹）
+
+另外自带两样东西：
+
+3. **服务端拦截**：微信 / 支付宝 / 银行 / 政府域名在服务器直接拒绝，客户端开全局也不会走代理（规则在 `sb.sh` 顶部的 `REJECT_DOMAINS` 里改）。
+4. **订阅服务**：生成 Clash / Shadowrocket / sing-box 订阅文件，nginx 按客户端 UA 分流。
+
+## 安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dulun/sing-box-manager/main/sb.sh -o sb.sh
+chmod +x sb.sh
+sudo ./sb.sh
+```
+
+## 用法
+
+```bash
+sudo ./sb.sh                    # 打开菜单
+sudo ./sb.sh add-vless [--port 443] [--sni www.microsoft.com] [--name TR-VLESS]
+sudo ./sb.sh add-hy2   [--port 443] [--name TR-Hy2] [--up 200] [--down 1000]
+sudo ./sb.sh list               # 显示所有节点：链接 + Clash 配置
+sudo ./sb.sh clash              # 生成 Clash 配置
+sudo ./sb.sh sub                # 生成订阅文件并启动订阅服务
+sudo ./sb.sh reject             # 重新应用服务端拦截规则
+sudo ./sb.sh status | restart | logs | uninstall
+```
+
+订阅地址（`sub` 会打印出来）：
+
+```
+http://<服务器IP>:62201/<TOKEN>/auto
+```
+
+## 文件说明
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `sb.sh` | 管理脚本本体 |
+| `reject-cn-domains.json` | 服务端拦截的域名列表（微信 / 支付宝 / 银行 / gov.cn） |
+| `deploy_reject.py` | 把拦截规则写进已有的 fscarmen 分文件配置（`/etc/sing-box/conf/03_route.json`） |
+
+## 注意
+
+- 改配置前自动备份，改完先跑 `sing-box check` 校验通过才重载。
+- `clash-local.yaml` 是个人 Clash 配置（含节点密码），不要放进仓库。
