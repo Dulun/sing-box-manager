@@ -12,6 +12,22 @@ sing-box 轻量管理脚本，只做两件事：
 
 ## 安装
 
+直接跑菜单：
+
+```bash
+sudo bash <(wget -qO- https://raw.githubusercontent.com/Dulun/sing-box-manager/main/sb.sh)
+```
+
+或者先下载再跑：
+
+```bash
+wget https://raw.githubusercontent.com/Dulun/sing-box-manager/main/sb.sh -O sb.sh
+chmod +x sb.sh
+sudo ./sb.sh
+```
+
+用 curl 也行：
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dulun/sing-box-manager/main/sb.sh -o sb.sh
 chmod +x sb.sh
